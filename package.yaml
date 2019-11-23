@@ -37,3 +37,17 @@ library:
   ghc-options:
     - -Wall
   source-dirs: src
+
+tests:
+  singer-test:
+    main: Spec.hs
+    source-dirs: test
+    ghc-options:
+      - -main-is Spec
+      - -threaded
+      - -Wall
+    dependencies:
+      - singer
+      - hspec
+      - string-qq
+      - bytestring
