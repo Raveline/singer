@@ -1,123 +1,114 @@
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 module Singer.Stream
   (
     -- * Main tools
-    getThreads
-  , buildAncestors
-    -- * Stream helpers
-  , tweetStream
+    streamThreads
+  , streamThreads'
+    -- * Tweet sources
+  , usingFile
+  , usingBS
   , baseFilter
-    -- * Debugging utilities
-  , printThreads
   , module Singer.Model
   ) where
 
-import           Control.Monad.State             (MonadState, gets, modify)
 import           Control.Monad.Trans.Resource    (MonadResource)
-import           Data.ByteString.Streaming       as BS
+import qualified Data.ByteString.Lazy            as BS (ByteString)
+import qualified Data.ByteString.Streaming       as SBS
 import           Data.ByteString.Streaming.Aeson (streamParse)
-import           Data.Foldable                   (traverse_)
 import           Data.Function                   ((&))
 import           Data.JsonStream.Parser          (Parser, arrayOf, value)
-import qualified Data.Map                        as M
-import           Data.Maybe                      (mapMaybe)
 import           Data.Text                       (Text)
-import qualified Data.Text.IO                    as TIO (putStrLn)
 import           Singer.Model                    (Thread (..), Tweet (..),
                                                   TweetAncestors, TweetId (..),
                                                   TweetSrc (..), fromTweetSrc,
                                                   mkThread)
 import           Streaming
+import           Streaming.Internal (Stream(Effect, Return))
 import qualified Streaming.Prelude               as S
 
-getTweets :: (MonadResource m) => FilePath -> S.Stream (S.Of TweetSrc) m (Maybe String, BS.ByteString m ())
-getTweets = streamParse (arrayOf parserTweet) . BS.readFile
+usingFile :: (MonadResource m) => FilePath -> S.Stream (S.Of TweetSrc) m ()
+usingFile = void . streamParse (arrayOf parserTweet) . SBS.readFile
 
-mapTweets :: (MonadState TweetAncestors m) => Tweet -> m ()
-mapTweets x = do
-  withChild <- findChild x
-  maybe (finishThread withChild) (storeTweet withChild) (replyTo x)
-
-findChild :: (MonadState TweetAncestors m) => Tweet -> m Tweet
-findChild current =
-  gets (M.lookup (id_ current))
-  >>= maybe (pure current) (associateChild current)
-
-associateChild :: (MonadState TweetAncestors m) => Tweet -> Tweet -> m Tweet
-associateChild parent child' = do
-  modify (M.delete (id_ child'))
-  pure $ parent { child = Just child' }
-
--- This tweet is not a reply to something: it is the first of a thread
--- or a single tweet.
-finishThread :: (MonadState TweetAncestors m) => Tweet -> m ()
-finishThread t = modify $ M.insert (id_ t) t
-
--- This tweet is an answer to a non-yet met parent, we store it and its parent id.
-storeTweet :: (MonadState TweetAncestors m) => Tweet -> TweetId -> m ()
-storeTweet current parentId = modify $ M.insert parentId current
+usingBS :: (Monad m) => BS.ByteString -> S.Stream (S.Of TweetSrc) m ()
+usingBS = void . streamParse (arrayOf parserTweet) . SBS.fromLazy
 
 parserTweet :: Parser TweetSrc
 parserTweet = value
 
+-- | Basic validation: we do not pick retweets, and we only pick replies to self.
 validTweet :: Text -> TweetSrc -> Bool
-validTweet screenName t = not (retweeted t) && (maybe True (== screenName) (inReplyToScreenName t))
-
--- | Simple producer of tweets from a JS file.
-tweetStream :: (MonadResource m) => FilePath -> S.Stream (S.Of TweetSrc) m ()
-tweetStream = void . getTweets
+validTweet screenName t = not (retweeted t) && maybe True (== screenName) (inReplyToScreenName t)
 
 -- | Morphs Twitter source representation to a more strongly typed model
-toTweet :: (MonadState TweetAncestors m) => S.Stream (S.Of TweetSrc) m r -> S.Stream (S.Of Tweet) m r
+toTweet :: (Monad m) => S.Stream (S.Of TweetSrc) m r -> S.Stream (S.Of Tweet) m r
 toTweet = S.catMaybes . S.map fromTweetSrc
 
 -- | A base filter that only removes answers and retweets
-baseFilter :: (MonadState TweetAncestors m) => Text -> S.Stream (S.Of TweetSrc) m r -> S.Stream (S.Of TweetSrc) m r
+baseFilter :: (Monad m) => Text -> S.Stream (S.Of TweetSrc) m r -> S.Stream (S.Of TweetSrc) m r
 baseFilter screenName = S.filter (validTweet screenName)
 
--- | Morphs a stream of tweets into a list of tweet with their children
-toThreads :: (MonadState TweetAncestors m) => S.Stream (S.Of TweetSrc) m r -> m r
-toThreads = S.mapM_ mapTweets . toTweet
+foundParent :: (Monad m) => S.Stream (S.Of Tweet) m () -> Maybe Tweet -> Tweet -> S.Stream (S.Of Thread) m ()
+foundParent src child' parent =
+  let withChild = parent { child = child' }
+      asThread = maybe (toThread' src Nothing) S.yield . mkThread $ withChild
+  in maybe asThread (const $ toThread' src (Just withChild)) (replyTo parent)
 
--- | A stream builder that composes:
--- - A source of tweet, typically built using `tweetStream`
--- - A filter for source tweets, a basic one is provided in `baseFilter`
--- All these are then fed into a converter that will trace tweets
--- history.
+didNotFindParent :: (Monad m) => S.Stream (S.Of Tweet) m () -> Maybe Tweet -> Tweet -> S.Stream (S.Of Thread) m ()
+didNotFindParent src child' parent =
+  let onIsReply = toThread' src (pure parent)
+      onIsNotReply = toThread' src Nothing
+      startNewThread = maybe onIsNotReply (const onIsReply) (replyTo parent)
+      continueCurrentThread = toThread' src child'
+  in maybe startNewThread (const continueCurrentThread) child'
+
+handleTweet :: (Monad m) => Maybe Tweet -> Tweet -> S.Stream (S.Of Tweet) m () -> S.Stream (S.Of Thread) m ()
+handleTweet child' parent src =
+  let childOfParent = pure (id_ parent) == (child' >>= replyTo)
+  in if childOfParent
+        then foundParent src child' parent
+        else didNotFindParent src child' parent
+
+toThread' :: (Monad m) => S.Stream (S.Of Tweet) m () -> Maybe Tweet -> S.Stream (S.Of Thread) m ()
+toThread' src current = Effect $ do
+  n <- S.next src
+  case n of
+    Left l -> pure $ Return l
+    Right r -> pure $ uncurry (handleTweet current) r
+
+toThread :: (Monad m) => S.Stream (S.Of Tweet) m () -> S.Stream (S.Of Thread) m ()
+toThread src = toThread' src Nothing
+
+-- | This is the main utility of this library. It streams threads read from
+-- a file containing a valid JSON with your tweets.
+-- Since this demands opening a file, you will need to wrap your call in a
+-- `runResourceT`.
 --
--- Since fetching the tweets typically require a MonadResource and
--- tweet history is constructed using a MonadState (over a Map), you
--- need to run this into a `runResourceT` and a `execStateT f M.empty` to
--- evaluate the stream.
-buildAncestors :: (MonadResource m, MonadState TweetAncestors m)
-  => S.Stream (S.Of TweetSrc) m r
-  -> (S.Stream (S.Of TweetSrc) m r -> S.Stream (S.Of TweetSrc) m r)
-  -> m r
-buildAncestors source filters =
-  source & filters & toThreads
-
--- | Main utility. You build the first parameter using `buildAncestors`.
 -- Basic example:
 --
---
--- > import Singer.Stream
--- > import qualified Data.Map as M (empty)
--- > source :: IO TweetAncestors
--- > source =
--- >    let = buildAncestors (tweetStream "tweets.js") (baseFilter "MyTweeterNickName")
--- >    in runResourceT $ execStateT stream M.empty
--- >
--- > main :: IO ()
--- > main = getThreads source >>= printThreads
---
--- You can easily intercalate something like the
-getThreads :: IO TweetAncestors -> IO [Thread]
-getThreads f = mapMaybe mkThread . M.elems <$> f
+-- > runResourceT $ streamThreads filepath "yourname" id
+streamThreads :: (MonadResource m)
+  => FilePath
+  -- ^ Twitter archive file name
+  -> Text
+  -- ^ Your twitter screen name, used to identify threads
+  -> (Thread -> Bool)
+  -- ^ Thread filter - use id if you don't want to filter anything
+  -> Stream (S.Of Thread) m ()
+  -- ^ Result as a stream of threads.
+streamThreads filepath screenName pred' =
+  usingFile filepath
+  & baseFilter screenName
+  & toTweet
+  & toThread
+  & S.filter pred'
 
--- | For debugging purpose
-printThreads :: [Thread] -> IO ()
-printThreads =
-  let go x = putStrLn (show (firstTweetAt x))
-           >> traverse_ TIO.putStrLn  (tweets x)
-           >> putStrLn "-------------------------------"
-  in traverse_ go
+-- | Variant of `streamThreads` that let you replace the initial source by
+-- an arbitrary provider (e.g., a file with `usingBS`; or potentially, a
+-- twitter API call).
+streamThreads' :: (Monad m)
+  => S.Stream (S.Of TweetSrc) m ()
+  -> Text
+  -> Stream (S.Of Thread) m ()
+streamThreads' source screenName =
+  source & baseFilter screenName & toTweet & toThread
