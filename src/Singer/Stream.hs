@@ -43,7 +43,7 @@ validTweet screenName t = not (retweeted t) && maybe True (== screenName) (inRep
 
 -- | Morphs Twitter source representation to a more strongly typed model
 toTweet :: (Monad m) => S.Stream (S.Of TweetSrc) m r -> S.Stream (S.Of Tweet) m r
-toTweet = S.catMaybes . S.map fromTweetSrc
+toTweet = S.mapMaybe fromTweetSrc
 
 -- | A base filter that only removes answers and retweets
 baseFilter :: (Monad m) => Text -> S.Stream (S.Of TweetSrc) m r -> S.Stream (S.Of TweetSrc) m r
@@ -53,7 +53,13 @@ foundParent :: Maybe Tweet -> Tweet -> Maybe Tweet
 foundParent child' parent = pure $ parent { child = child' }
 
 didNotFindParent :: Maybe Tweet -> Tweet -> Maybe Tweet
-didNotFindParent child' parent = maybe (pure parent) (const child')  (replyTo =<< child')
+didNotFindParent child' parent = let
+  ongoingThread = void . replyTo
+  verifiedChild = do
+    t <- child'
+    ongoingThread t
+    child'
+  in verifiedChild <|> pure parent
 
 extractThread :: Maybe Tweet -> Maybe Thread
 extractThread tweet = do
@@ -93,8 +99,8 @@ streamThreads :: (MonadResource m)
   -- ^ Thread filter - use id if you don't want to filter anything
   -> Stream (S.Of Thread) m ()
   -- ^ Result as a stream of threads.
-streamThreads filepath screenName pred' =
-  usingFile filepath
+streamThreads filepath screenName pred'
+  = usingFile filepath
   & baseFilter screenName
   & toTweet
   & toThread
