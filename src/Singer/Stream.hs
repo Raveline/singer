@@ -53,7 +53,7 @@ baseFilter screenName = S.filter (validTweet screenName)
 
 
 data ThreadState = ThreadState
-     { lastTweet     :: Tweet
+     { nextTweet     :: Tweet
      , ongoingThread :: Map TweetId [Tweet]
      } deriving (Show)
 
@@ -116,7 +116,7 @@ extractThread st = let
     guard . not . null $ children t
     mkThread t
 
-  in st >>= go . lastTweet
+  in st >>= go . nextTweet
 
 
 toThread :: (Monad m) => S.Stream (S.Of Tweet) m () -> S.Stream (S.Of Thread) m ()
