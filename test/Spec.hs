@@ -4,14 +4,15 @@ module Spec
     main
   ) where
 
-import Control.Monad (join)
-import Data.Function ((&))
-import Data.Maybe (fromMaybe)
-import Test.Hspec
-import Tweets (fixture)
-import Singer.Stream
-import Singer.Model (Thread(..))
-import Streaming.Prelude (head_)
+import           Control.Monad     (join)
+import           Data.Function     ((&))
+import           Data.Maybe        (fromMaybe)
+import           Data.Tree         (Tree (Node))
+import           Singer.Model      (Thread (..))
+import           Singer.Stream
+import           Streaming.Prelude (head_)
+import           Test.Hspec
+import           Tweets            (fixture)
 
 main :: IO ()
 main = hspec $
@@ -23,4 +24,4 @@ main = hspec $
     it "Even with tweets in between" $
       length (tweets thread) `shouldBe` 3
     it "Threads are in the proper order" $
-      tweets thread `shouldBe` ["Beginning of thread", "Middle of thread", "End of thread"]
+      tweets thread `shouldBe` (Node "Beginning of thread" [Node "Middle of thread" [Node "End of thread" []]])
