@@ -1,4 +1,4 @@
-{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE FlexibleContexts    #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 module Singer.Stream
   (
@@ -12,19 +12,20 @@ module Singer.Stream
   , module Singer.Model
   ) where
 
+import           Control.Monad                   (guard)
 import           Control.Monad.Trans.Resource    (MonadResource)
 import qualified Data.ByteString.Lazy            as BS (ByteString)
 import qualified Data.ByteString.Streaming       as SBS
 import           Data.ByteString.Streaming.Aeson (streamParse)
 import           Data.Function                   ((&))
 import           Data.JsonStream.Parser          (Parser, arrayOf, value)
+import           Data.Maybe                      (isNothing)
 import           Data.Text                       (Text)
 import           Singer.Model                    (Thread (..), Tweet (..),
                                                   TweetAncestors, TweetId (..),
                                                   TweetSrc (..), fromTweetSrc,
                                                   mkThread)
 import           Streaming
-import           Streaming.Internal (Stream(Effect, Return))
 import qualified Streaming.Prelude               as S
 
 usingFile :: (MonadResource m) => FilePath -> S.Stream (S.Of TweetSrc) m ()
@@ -42,42 +43,44 @@ validTweet screenName t = not (retweeted t) && maybe True (== screenName) (inRep
 
 -- | Morphs Twitter source representation to a more strongly typed model
 toTweet :: (Monad m) => S.Stream (S.Of TweetSrc) m r -> S.Stream (S.Of Tweet) m r
-toTweet = S.catMaybes . S.map fromTweetSrc
+toTweet = S.mapMaybe fromTweetSrc
 
 -- | A base filter that only removes answers and retweets
 baseFilter :: (Monad m) => Text -> S.Stream (S.Of TweetSrc) m r -> S.Stream (S.Of TweetSrc) m r
 baseFilter screenName = S.filter (validTweet screenName)
 
-foundParent :: (Monad m) => S.Stream (S.Of Tweet) m () -> Maybe Tweet -> Tweet -> S.Stream (S.Of Thread) m ()
-foundParent src child' parent =
-  let withChild = parent { child = child' }
-      asThread = maybe (toThread' src Nothing) S.yield . mkThread $ withChild
-  in maybe asThread (const $ toThread' src (Just withChild)) (replyTo parent)
+foundParent :: Maybe Tweet -> Tweet -> Maybe Tweet
+foundParent child' parent = pure $ parent { child = child' }
 
-didNotFindParent :: (Monad m) => S.Stream (S.Of Tweet) m () -> Maybe Tweet -> Tweet -> S.Stream (S.Of Thread) m ()
-didNotFindParent src child' parent =
-  let onIsReply = toThread' src (pure parent)
-      onIsNotReply = toThread' src Nothing
-      startNewThread = maybe onIsNotReply (const onIsReply) (replyTo parent)
-      continueCurrentThread = toThread' src child'
-  in maybe startNewThread (const continueCurrentThread) child'
+didNotFindParent :: Maybe Tweet -> Tweet -> Maybe Tweet
+didNotFindParent child' parent = let
+  ongoingThread = void . replyTo
+  verifiedChild = do
+    t <- child'
+    ongoingThread t
+    child'
+  in verifiedChild <|> pure parent
 
-handleTweet :: (Monad m) => Maybe Tweet -> Tweet -> S.Stream (S.Of Tweet) m () -> S.Stream (S.Of Thread) m ()
-handleTweet child' parent src =
-  let childOfParent = pure (id_ parent) == (child' >>= replyTo)
+extractThread :: Maybe Tweet -> Maybe Thread
+extractThread tweet = do
+  t <- tweet
+  completedThread t
+  hasMultipleTweets t
+  mkThread t
+    where
+      completedThread   = guard . isNothing . replyTo
+      hasMultipleTweets = void . child
+
+
+handleTweet :: Maybe Tweet -> Tweet -> Maybe Tweet
+handleTweet child' parent = let
+  childOfParent = pure (id_ parent) == (child' >>= replyTo)
   in if childOfParent
-        then foundParent src child' parent
-        else didNotFindParent src child' parent
-
-toThread' :: (Monad m) => S.Stream (S.Of Tweet) m () -> Maybe Tweet -> S.Stream (S.Of Thread) m ()
-toThread' src current = Effect $ do
-  n <- S.next src
-  case n of
-    Left l -> pure $ Return l
-    Right r -> pure $ uncurry (handleTweet current) r
+        then foundParent child' parent
+        else didNotFindParent child' parent
 
 toThread :: (Monad m) => S.Stream (S.Of Tweet) m () -> S.Stream (S.Of Thread) m ()
-toThread src = toThread' src Nothing
+toThread = S.catMaybes . S.scan handleTweet Nothing extractThread
 
 -- | This is the main utility of this library. It streams threads read from
 -- a file containing a valid JSON with your tweets.
@@ -96,8 +99,8 @@ streamThreads :: (MonadResource m)
   -- ^ Thread filter - use id if you don't want to filter anything
   -> Stream (S.Of Thread) m ()
   -- ^ Result as a stream of threads.
-streamThreads filepath screenName pred' =
-  usingFile filepath
+streamThreads filepath screenName pred'
+  = usingFile filepath
   & baseFilter screenName
   & toTweet
   & toThread
