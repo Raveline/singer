@@ -19,6 +19,8 @@ import qualified Data.ByteString.Streaming       as SBS
 import           Data.ByteString.Streaming.Aeson (streamParse)
 import           Data.Function                   ((&))
 import           Data.JsonStream.Parser          (Parser, arrayOf, value)
+import           Data.Map                        (Map)
+import qualified Data.Map                        as M
 import           Data.Maybe                      (isNothing)
 import           Data.Text                       (Text)
 import           Singer.Model                    (Thread (..), Tweet (..),
@@ -49,35 +51,55 @@ toTweet = S.mapMaybe fromTweetSrc
 baseFilter :: (Monad m) => Text -> S.Stream (S.Of TweetSrc) m r -> S.Stream (S.Of TweetSrc) m r
 baseFilter screenName = S.filter (validTweet screenName)
 
-foundParent :: Maybe Tweet -> Tweet -> Maybe Tweet
-foundParent child' parent = pure $ parent { child = child' }
 
-didNotFindParent :: Maybe Tweet -> Tweet -> Maybe Tweet
-didNotFindParent child' parent = let
-  ongoingThread = void . replyTo
-  verifiedChild = do
-    t <- child'
-    ongoingThread t
-    child'
-  in verifiedChild <|> pure parent
+data ThreadState = ThreadState
+     { nextTweet     :: Tweet
+     , ongoingThread :: Map TweetId [Tweet]
+     } deriving (Show)
 
-extractThread :: Maybe Tweet -> Maybe Thread
-extractThread tweet = do
-  t <- tweet
-  completedThread t
-  hasMultipleTweets t
-  mkThread t
-    where
-      completedThread   = guard . isNothing . replyTo
-      hasMultipleTweets = void . child
+addOngoingThread :: Tweet -> Map TweetId [Tweet] -> Map TweetId [Tweet]
+addOngoingThread t ongoing = let
+  insertTweet replies = pure $ t : concat replies
+  updateRepliesList k = M.alter insertTweet k ongoing
+  in maybe ongoing updateRepliesList (replyTo t)
+
+getAndDelete :: Ord k => k -> Map k v -> (Maybe v, Map k v)
+getAndDelete = M.updateLookupWithKey (const $ const Nothing)
+
+attachReplies :: Tweet -> Maybe [Tweet] -> Tweet
+attachReplies t replies = t {children = concat replies}
 
 
-handleTweet :: Maybe Tweet -> Tweet -> Maybe Tweet
-handleTweet child' parent = let
-  childOfParent = pure (id_ parent) == (child' >>= replyTo)
-  in if childOfParent
-        then foundParent child' parent
-        else didNotFindParent child' parent
+handleHead :: Tweet -> ThreadState
+handleHead t = let
+  initOngoingThread = maybe mempty (`M.singleton` [t]) (replyTo t)
+  in ThreadState t initOngoingThread
+
+handleTail' :: Tweet -> Map TweetId [Tweet] -> ThreadState
+handleTail' t ongoing = let
+  (replies, ongoing') = getAndDelete (id_ t) ongoing
+  current = attachReplies t replies
+  ongoingWithCurrent = addOngoingThread current ongoing'
+  in ThreadState current ongoingWithCurrent
+
+handleTail :: Tweet -> ThreadState -> ThreadState
+handleTail t = handleTail' t . ongoingThread
+
+handleTweet :: Maybe ThreadState -> Tweet -> Maybe ThreadState
+handleTweet st t = pure $ maybe (handleHead t) (handleTail t) st
+
+
+extractThread :: Maybe ThreadState -> Maybe Thread
+extractThread st = let
+
+  go :: Tweet -> Maybe Thread
+  go t = do
+    guard . isNothing $ replyTo t
+    guard . not . null $ children t
+    mkThread t
+
+  in st >>= go . nextTweet
+
 
 toThread :: (Monad m) => S.Stream (S.Of Tweet) m () -> S.Stream (S.Of Thread) m ()
 toThread = S.catMaybes . S.scan handleTweet Nothing extractThread
