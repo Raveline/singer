@@ -59,15 +59,9 @@ data ThreadState = ThreadState
 
 addOngoingThread :: Tweet -> Map TweetId [Tweet] -> Map TweetId [Tweet]
 addOngoingThread t ongoing = let
-
-  insertTweet :: Maybe [Tweet] -> Maybe [Tweet]
   insertTweet replies = pure $ t : concat replies
-
-  updateRepliesList :: TweetId -> Map TweetId [Tweet]
   updateRepliesList k = M.alter insertTweet k ongoing
-
   in maybe ongoing updateRepliesList (replyTo t)
-
 
 getAndDelete :: Ord k => k -> Map k v -> (Maybe v, Map k v)
 getAndDelete = M.updateLookupWithKey (const $ const Nothing)
@@ -78,25 +72,14 @@ attachReplies t replies = t {children = concat replies}
 
 handleHead :: Tweet -> ThreadState
 handleHead t = let
-
-  initOngoingThread :: Map TweetId [Tweet]
   initOngoingThread = maybe mempty (`M.singleton` [t]) (replyTo t)
-
   in ThreadState t initOngoingThread
 
 handleTail' :: Tweet -> Map TweetId [Tweet] -> ThreadState
 handleTail' t ongoing = let
-
-  replies :: Maybe [Tweet]
-  ongoing' :: Map TweetId [Tweet]
   (replies, ongoing') = getAndDelete (id_ t) ongoing
-
-  current :: Tweet
   current = attachReplies t replies
-
-  ongoingWithCurrent :: Map TweetId [Tweet]
   ongoingWithCurrent = addOngoingThread current ongoing'
-
   in ThreadState current ongoingWithCurrent
 
 handleTail :: Tweet -> ThreadState -> ThreadState
